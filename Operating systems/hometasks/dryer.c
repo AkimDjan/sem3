@@ -1,3 +1,4 @@
+// dryer.c
 #define _XOPEN_SOURCE 700
 #include <stdio.h>
 #include <stdlib.h>
@@ -8,7 +9,22 @@
 #include <semaphore.h>
 #include <errno.h>
 
-#define MAX_LINE 128
+#define RECORD_SIZE 32
+
+static int safe_read_all(int fd, void *buf, size_t count) {
+    char *p = buf;
+    while (count > 0) {
+        ssize_t r = read(fd, p, count);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (r == 0) return 0;
+        p += r;
+        count -= r;
+    }
+    return 1;
+}
 
 int get_time(const char *filename, const char *type) {
     FILE *f = fopen(filename, "r");
@@ -16,12 +32,15 @@ int get_time(const char *filename, const char *type) {
         perror(filename);
         exit(1);
     }
-    char t[32];
+    char line[256];
+    char t[128];
     int sec;
-    while (fscanf(f, "%31[^:]: %d\n", t, &sec) == 2) {
-        if (strcmp(t, type) == 0) {
-            fclose(f);
-            return sec;
+    while (fgets(line, sizeof(line), f)) {
+        if (sscanf(line, " %127[^: ] : %d", t, &sec) == 2) {
+            if (strcmp(t, type) == 0) {
+                fclose(f);
+                return sec;
+            }
         }
     }
     fclose(f);
@@ -36,27 +55,42 @@ int main() {
         perror("dryer: sem_open failed");
         return 1;
     }
+
     int fd = open(fifo_path, O_RDONLY);
     if (fd < 0) {
         perror("dryer: open fifo failed");
         sem_close(table_sem);
         return 1;
     }
-    char type[32];
-    while (read(fd, type, sizeof(type)) > 0) {
+
+    char buf[RECORD_SIZE];
+    while (1) {
+        int rr = safe_read_all(fd, buf, RECORD_SIZE);
+        if (rr == -1) {
+            perror("dryer: read failed");
+            break;
+        }
+        if (rr == 0) break;
+        buf[RECORD_SIZE - 1] = '\0';
+        char type[RECORD_SIZE];
+        strncpy(type, buf, RECORD_SIZE - 1);
+        type[RECORD_SIZE - 1] = '\0';
+        if (type[0] == '\0') continue;
         printf("Dryer: got %s from table\n", type);
         fflush(stdout);
         int dry_time = get_time("dryer.txt", type);
         printf("Dryer: drying %s (%d sec)\n", type, dry_time);
         fflush(stdout);
         sleep(dry_time);
-        if (sem_post(table_sem) == -1) {
+        while (sem_post(table_sem) == -1) {
+            if (errno == EINTR) continue;
             perror("dryer: sem_post failed");
             break;
         }
         printf("Dryer: finished drying %s (free space available)\n", type);
         fflush(stdout);
     }
+
     close(fd);
     sem_close(table_sem);
     return 0;
