@@ -5,24 +5,35 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <string.h>
-#include <sys/stat.h>
-#include <semaphore.h>
 #include <errno.h>
 
 #define RECORD_SIZE 32
+#define MAX_LINE 256
 
-static int safe_write_all(int fd, const void *buf, size_t count) {
+static int safe_write_all(int fd, const void *buf, size_t n) {
     const char *p = buf;
-    while (count > 0) {
-        ssize_t w = write(fd, p, count);
+    while (n > 0) {
+        ssize_t w = write(fd, p, n);
         if (w < 0) {
             if (errno == EINTR) continue;
             return -1;
         }
         p += w;
-        count -= w;
+        n -= w;
     }
     return 0;
+}
+
+static ssize_t safe_read_some(int fd, void *buf, size_t n) {
+    char *p = buf;
+    while (1) {
+        ssize_t r = read(fd, p, n);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        return r;
+    }
 }
 
 int get_time(const char *filename, const char *type) {
@@ -48,41 +59,41 @@ int get_time(const char *filename, const char *type) {
 }
 
 int main() {
-    const char *fifo_path = "table.fifo";
-    sem_t *table_sem = sem_open("/table_sem", 0);
-    if (table_sem == SEM_FAILED) {
-        perror("washer: sem_open failed");
+    const char *fifo_in = "table_in.fifo";   
+    const char *fifo_out = "table_out.fifo"; 
+
+    int fd_out = open(fifo_out, O_RDONLY);
+    if (fd_out < 0) {
+        perror("washer: open table_out for read");
         return 1;
     }
-
-    int fd = open(fifo_path, O_WRONLY);
-    if (fd < 0) {
-        perror("washer: open fifo failed");
-        sem_close(table_sem);
+    int fd_in = open(fifo_in, O_WRONLY);
+    if (fd_in < 0) {
+        perror("washer: open table_in for write");
+        close(fd_out);
         return 1;
     }
 
     FILE *dirty = fopen("dishes.txt", "r");
     if (!dirty) {
         perror("dishes.txt");
-        close(fd);
-        sem_close(table_sem);
+        close(fd_out);
+        close(fd_in);
         return 1;
     }
 
-    char line[256];
-    char type[128];
+    char line[MAX_LINE];
+    char type[RECORD_SIZE];
     int count;
+
     while (fgets(line, sizeof(line), dirty)) {
-        if (sscanf(line, " %127[^: ] : %d", type, &count) != 2) continue;
+        if (sscanf(line, " %31[^: ] : %d", type, &count) != 2) continue;
         for (int i = 0; i < count; ++i) {
-            while (sem_wait(table_sem) == -1) {
-                if (errno == EINTR) continue;
-                perror("washer: sem_wait failed");
-                fclose(dirty);
-                close(fd);
-                sem_close(table_sem);
-                return 1;
+            char token;
+            ssize_t r = safe_read_some(fd_out, &token, 1);
+            if (r <= 0) {
+                if (r < 0) perror("washer: read token failed");
+                break;
             }
             int wash_time = get_time("washer.txt", type);
             printf("Washer: washing %s (%d sec)\n", type, wash_time);
@@ -91,21 +102,19 @@ int main() {
             char buf[RECORD_SIZE];
             memset(buf, 0, sizeof(buf));
             strncpy(buf, type, RECORD_SIZE - 1);
-            if (safe_write_all(fd, buf, RECORD_SIZE) == -1) {
-                perror("washer: write to fifo failed");
-                sem_post(table_sem);
+            if (safe_write_all(fd_in, buf, RECORD_SIZE) == -1) {
+                perror("washer: write to table_in failed");
+                close(fd_out);
+                close(fd_in);
                 fclose(dirty);
-                close(fd);
-                sem_close(table_sem);
                 return 1;
             }
             printf("Washer: put %s on the table\n", type);
             fflush(stdout);
         }
     }
-
     fclose(dirty);
-    close(fd);
-    sem_close(table_sem);
+    close(fd_in);
+    close(fd_out);
     return 0;
 }
