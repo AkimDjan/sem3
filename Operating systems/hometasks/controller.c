@@ -10,8 +10,8 @@
 #include <string.h>
 #include <errno.h>
 
-const char *fifo_in = "table_in.fifo"; 
-const char *fifo_out = "table_out.fifo"; 
+const char *fifo_in = "table_in.fifo";   // washer -> dryer
+const char *fifo_out = "table_out.fifo"; // dryer -> washer
 
 pid_t washer_pid = -1;
 pid_t dryer_pid = -1;
@@ -45,7 +45,6 @@ static int write_all(int fd, const void *buf, size_t n) {
 int main() {
     signal(SIGINT, term_handler);
     signal(SIGTERM, term_handler);
-
     const char *limit_str = getenv("TABLE_LIMIT");
     if (!limit_str) {
         fprintf(stderr, "Error: set TABLE_LIMIT environment variable\n");
@@ -56,7 +55,6 @@ int main() {
         fprintf(stderr, "Error: TABLE_LIMIT must be positive integer\n");
         return 1;
     }
-
     unlink(fifo_in);
     unlink(fifo_out);
     if (mkfifo(fifo_in, 0666) == -1) {
@@ -68,7 +66,6 @@ int main() {
         unlink(fifo_in);
         return 1;
     }
-
     int ctrl_in_fd = open(fifo_in, O_RDWR);
     if (ctrl_in_fd < 0) {
         perror("controller open fifo_in O_RDWR");
@@ -85,6 +82,7 @@ int main() {
 
     char token = 'T';
     for (int i = 0; i < table_limit; ++i) {
+        // кладем токены свободных мест на стол
         if (write_all(ctrl_out_fd, &token, 1) == -1) {
             perror("controller write initial tokens");
             close(ctrl_in_fd);
@@ -121,6 +119,7 @@ int main() {
         return 1;
     }
 
+    // ждем обоих детей
     int status;
     waitpid(washer_pid, &status, 0);
     waitpid(dryer_pid, &status, 0);

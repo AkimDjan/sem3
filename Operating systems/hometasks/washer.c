@@ -59,9 +59,9 @@ int get_time(const char *filename, const char *type) {
 }
 
 int main() {
-    const char *fifo_in = "table_in.fifo";   
-    const char *fifo_out = "table_out.fifo"; 
-
+    const char *fifo_in = "table_in.fifo";   // washer -> dryer
+    const char *fifo_out = "table_out.fifo"; // dryer -> washer 
+    // открываем fifo: читаем токены освобождения в table_out, пишем вымытую посуду в table_in
     int fd_out = open(fifo_out, O_RDONLY);
     if (fd_out < 0) {
         perror("washer: open table_out for read");
@@ -73,7 +73,6 @@ int main() {
         close(fd_out);
         return 1;
     }
-
     FILE *dirty = fopen("dishes.txt", "r");
     if (!dirty) {
         perror("dishes.txt");
@@ -81,24 +80,27 @@ int main() {
         close(fd_in);
         return 1;
     }
-
     char line[MAX_LINE];
     char type[RECORD_SIZE];
     int count;
-
     while (fgets(line, sizeof(line), dirty)) {
         if (sscanf(line, " %31[^: ] : %d", type, &count) != 2) continue;
         for (int i = 0; i < count; ++i) {
+            // синхронизация: резервируем слот на столе
+            // прочитываем токен из table_out.fifo и если токенов нет, чтение блокируется до момента, когда dryer/контроллер запишут токен
             char token;
             ssize_t r = safe_read_some(fd_out, &token, 1);
             if (r <= 0) {
+                // ошибка чтения или EOF, завершаем
                 if (r < 0) perror("washer: read token failed");
                 break;
             }
+            // теперь слот зарезервирован, моем
             int wash_time = get_time("washer.txt", type);
             printf("Washer: washing %s (%d sec)\n", type, wash_time);
             fflush(stdout);
             sleep(wash_time);
+            // передача: кладём вымытую посуду на стол через table_in.fifo
             char buf[RECORD_SIZE];
             memset(buf, 0, sizeof(buf));
             strncpy(buf, type, RECORD_SIZE - 1);
@@ -113,8 +115,10 @@ int main() {
             fflush(stdout);
         }
     }
+    // закрываем запись в table_in, чтобы dryer получил EOF после всех предметов
     fclose(dirty);
     close(fd_in);
+    // закрываем дескриптор чтения токенов и завершаем (controller держит запись открытой)
     close(fd_out);
     return 0;
 }

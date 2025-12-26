@@ -1,27 +1,56 @@
+// washer.c
 #define _XOPEN_SOURCE 700
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <string.h>
-#include <sys/stat.h>
+#include <errno.h>
 
-#define MAX_LINE 128
+#define RECORD_SIZE 32
+#define MAX_LINE 256
 
-typedef struct {
-    char type[32];
-    int time;
-} DishTime;
+static int safe_write_all(int fd, const void *buf, size_t n) {
+    const char *p = buf;
+    while (n > 0) {
+        ssize_t w = write(fd, p, n);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        p += w;
+        n -= w;
+    }
+    return 0;
+}
+
+static ssize_t safe_read_some(int fd, void *buf, size_t n) {
+    char *p = buf;
+    while (1) {
+        ssize_t r = read(fd, p, n);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        return r;
+    }
+}
 
 int get_time(const char *filename, const char *type) {
     FILE *f = fopen(filename, "r");
-    if (!f) { perror(filename); exit(1); }
-
-    DishTime d;
-    while (fscanf(f, "%31[^:]: %d\n", d.type, &d.time) == 2) {
-        if (strcmp(d.type, type) == 0) {
-            fclose(f);
-            return d.time;
+    if (!f) {
+        perror(filename);
+        exit(1);
+    }
+    char line[256];
+    char t[128];
+    int sec;
+    while (fgets(line, sizeof(line), f)) {
+        if (sscanf(line, " %127[^: ] : %d", t, &sec) == 2) {
+            if (strcmp(t, type) == 0) {
+                fclose(f);
+                return sec;
+            }
         }
     }
     fclose(f);
@@ -30,28 +59,80 @@ int get_time(const char *filename, const char *type) {
 }
 
 int main() {
-    const char *fifo_path = "table.fifo";
-    mkfifo(fifo_path, 0666);
+    const char *fifo_in = "table_in.fifo";   // washer -> dryer
+    const char *fifo_out = "table_out.fifo"; // dryer -> washer (tokens)
 
-    int fd = open(fifo_path, O_WRONLY);
-    if (fd < 0) { perror("open fifo"); exit(1); }
+    // Открываем FIFO: читаем токены освобождения (table_out),
+    // и пишем вымытую посуду в table_in.
+    // Открытие здесь блокируемое не будет, если controller уже открыл FIFO O_RDWR.
+    int fd_out = open(fifo_out, O_RDONLY);
+    if (fd_out < 0) {
+        perror("washer: open table_out for read");
+        return 1;
+    }
+    int fd_in = open(fifo_in, O_WRONLY);
+    if (fd_in < 0) {
+        perror("washer: open table_in for write");
+        close(fd_out);
+        return 1;
+    }
 
     FILE *dirty = fopen("dishes.txt", "r");
-    if (!dirty) { perror("dishes.txt"); exit(1); }
+    if (!dirty) {
+        perror("dishes.txt");
+        close(fd_out);
+        close(fd_in);
+        return 1;
+    }
 
-    char type[32];
+    char line[MAX_LINE];
+    char type[RECORD_SIZE];
     int count;
 
-    while (fscanf(dirty, "%31[^:]: %d\n", type, &count) == 2) {
-        for (int i = 0; i < count; i++) {
-            int t = get_time("washer.txt", type);
-            printf("Washer: washing %s (%d sec)\n", type, t);
-            sleep(t);
-            write(fd, type, strlen(type) + 1);
+    while (fgets(line, sizeof(line), dirty)) {
+        if (sscanf(line, " %31[^: ] : %d", type, &count) != 2) continue;
+        for (int i = 0; i < count; ++i) {
+            // --- СИНХРОНИЗАЦИЯ: резервируем слот на столе ---
+            // Прочитываем один токен из table_out.fifo; если токенов нет,
+            // чтение блокируется до момента, когда dryer/контроллер запишут токен.
+            char token;
+            ssize_t r = safe_read_some(fd_out, &token, 1);
+            if (r <= 0) {
+                // ошибка чтения или EOF — завершаем
+                if (r < 0) perror("washer: read token failed");
+                break;
+            }
+            // теперь слот зарезервирован — можно мыть
+            int wash_time = get_time("washer.txt", type);
+            printf("Washer: washing %s (%d sec)\n", type, wash_time);
+            fflush(stdout);
+            sleep(wash_time);
+
+            // --- ПЕРЕДАЧА: кладём вымытую посуду на стол через table_in.fifo ---
+            char buf[RECORD_SIZE];
+            memset(buf, 0, sizeof(buf));
+            strncpy(buf, type, RECORD_SIZE - 1);
+            if (safe_write_all(fd_in, buf, RECORD_SIZE) == -1) {
+                perror("washer: write to table_in failed");
+                // вернуть токен обратно, чтобы не "потерять" слот
+                // (пытаемся записать обратно в table_out: но у нас только read end)
+                // Примечание: вернуть токен невозможно из read-only конца; в таком случае
+                // слот теряется — это допустимо как упрощение учебной модели.
+                close(fd_out);
+                close(fd_in);
+                fclose(dirty);
+                return 1;
+            }
+            printf("Washer: put %s on the table\n", type);
+            fflush(stdout);
         }
     }
 
-    close(fd);
+    // Закрываем запись в table_in, чтобы dryer получил EOF после всех предметов.
     fclose(dirty);
+    close(fd_in);
+
+    // Закрываем дескриптор чтения токенов и завершаем (controller держит запись открытой).
+    close(fd_out);
     return 0;
 }
